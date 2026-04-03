@@ -137,6 +137,7 @@ function MainEditor() {
   const [searchParams] = useSearchParams();
   const [isAICoreVisible, setIsAICoreVisible] = useState(false);
   const [isAddTrackModalOpen, setIsAddTrackModalOpen] = useState(false);
+  const [isStitchInstructionOpen, setIsStitchInstructionOpen] = useState(false);
   const [selectedTrackType, setSelectedTrackType] = useState('Instrument');
   const [tracks, setTracks] = useState<Array<{ id: number; type: string; name: string; icon: string; clipClass: string }>>([]);
 
@@ -150,6 +151,20 @@ function MainEditor() {
     { id: 'Audio', icon: 'mic', subtitle: 'Recorded / Live Signal Path' },
     { id: 'Bus', icon: 'route', subtitle: 'Routing / Group Channel' },
   ];
+
+  const stitchInstructionsText = `## Stitch Instructions
+
+Get the images and code for the following Stitch project's screens:
+
+## Project
+Title: Bach Studio 프로젝트 요구사항 (PRD)
+ID: 12167813109906429309
+
+## Screens:
+1. Piano Roll Editor (English 16:9)
+    ID: 8c7605a7b7fb4af8b4c576944be532e4
+
+Use a utility like curl -L to download the hosted URLs.`;
 
   const handleAddTrack = () => {
     const selectedOption = trackTypeOptions.find((option) => option.id === selectedTrackType) ?? trackTypeOptions[0];
@@ -287,7 +302,12 @@ function MainEditor() {
             </div>
 
             {tracks.map((track) => (
-              <div key={track.id} className="h-20 flex bg-surface-container-low/50 border-b border-outline-variant/5">
+              <div
+                key={track.id}
+                onDoubleClick={() => setIsStitchInstructionOpen(true)}
+                title="Double-click to open Stitch instructions"
+                className="h-20 flex bg-surface-container-low/50 border-b border-outline-variant/5 cursor-default"
+              >
                 <div className="w-48 bg-surface-container-high border-r border-outline-variant/10 p-3 flex flex-col justify-between">
                   <div className="flex items-center gap-2">
                     <span className="material-symbols-outlined text-sm text-primary">{track.icon}</span>
@@ -434,6 +454,26 @@ function MainEditor() {
               >
                 Add Track
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isStitchInstructionOpen && (
+        <div className="fixed inset-0 flex items-center justify-center bg-black/70 backdrop-blur-[2px] z-[120] p-6">
+          <div className="w-full max-w-3xl bg-surface-container-highest border border-outline-variant/30 flex flex-col">
+            <div className="px-6 py-4 border-b border-outline-variant/20 flex items-center justify-between">
+              <h2 className="text-lg font-black tracking-tight uppercase text-on-surface">Stitch Instructions</h2>
+              <button
+                onClick={() => setIsStitchInstructionOpen(false)}
+                className="text-on-surface-variant hover:text-white"
+                title="Close"
+              >
+                <span className="material-symbols-outlined">close</span>
+              </button>
+            </div>
+            <div className="p-6">
+              <pre className="whitespace-pre-wrap text-sm leading-6 text-on-surface-variant font-mono">{stitchInstructionsText}</pre>
             </div>
           </div>
         </div>
