@@ -2,7 +2,73 @@ import { useEffect, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import { Route, Routes, useNavigate, useSearchParams } from 'react-router-dom';
 import * as Tone from 'tone';
-import { Piano } from '@tonejs/piano/build/piano/Piano';
+
+const KEYBOARD_BASE_CODE_TO_MIDI: Record<string, number> = {
+  Digit1: 36,
+  Digit2: 38,
+  Digit3: 40,
+  Digit4: 41,
+  Digit5: 43,
+  Digit6: 45,
+  Digit7: 47,
+  Digit8: 48,
+  Digit9: 50,
+  Digit0: 52,
+  KeyQ: 53,
+  KeyW: 55,
+  KeyE: 57,
+  KeyR: 59,
+  KeyT: 60,
+  KeyY: 62,
+  KeyU: 64,
+  KeyI: 65,
+  KeyO: 67,
+  KeyP: 69,
+  KeyA: 71,
+  KeyS: 72,
+  KeyD: 74,
+  KeyF: 76,
+  KeyG: 77,
+  KeyH: 79,
+  KeyJ: 81,
+  KeyK: 83,
+  KeyL: 84,
+  KeyZ: 86,
+  KeyX: 88,
+  KeyC: 89,
+  KeyV: 91,
+  KeyB: 93,
+  KeyN: 95,
+  KeyM: 96,
+};
+
+const KEYBOARD_SHIFT_SHARP_CODES = new Set([
+  'Digit1',
+  'Digit2',
+  'Digit4',
+  'Digit5',
+  'Digit6',
+  'Digit8',
+  'Digit9',
+  'KeyQ',
+  'KeyW',
+  'KeyE',
+  'KeyT',
+  'KeyY',
+  'KeyI',
+  'KeyO',
+  'KeyP',
+  'KeyS',
+  'KeyD',
+  'KeyG',
+  'KeyH',
+  'KeyJ',
+  'KeyL',
+  'KeyZ',
+  'KeyC',
+  'KeyV',
+  'KeyB',
+]);
 
 function LandingView({ onStartProject }: { onStartProject: () => void }) {
   return (
@@ -145,6 +211,10 @@ function MainEditor() {
   const [isPianoRollOpen, setIsPianoRollOpen] = useState(false);
   const [isRecorderOpen, setIsRecorderOpen] = useState(false);
   const [activePianoTrackId, setActivePianoTrackId] = useState<number | null>(null);
+  const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
+  const [activeKeyboardMidiNotes, setActiveKeyboardMidiNotes] = useState<number[]>([]);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackSeconds, setPlaybackSeconds] = useState(0);
   const [pianoTool, setPianoTool] = useState<'select' | 'draw'>('select');
   const [selectedNoteIds, setSelectedNoteIds] = useState<number[]>([]);
   const [dragState, setDragState] = useState<null | {
@@ -160,32 +230,38 @@ function MainEditor() {
     currentX: number;
     currentY: number;
   }>(null);
-  const [isAudioReady, setIsAudioReady] = useState(false);
-  const [isAudioLoading, setIsAudioLoading] = useState(false);
-  const [audioError, setAudioError] = useState<string | null>(null);
 
   const gridRef = useRef<HTMLDivElement | null>(null);
   const pianoKeysRef = useRef<HTMLDivElement | null>(null);
   const isSyncingScrollRef = useRef(false);
-  const pianoEngineRef = useRef<Piano | null>(null);
+  const samplerRef = useRef<Tone.Sampler | null>(null);
+  const heldKeyboardNotesRef = useRef<Record<string, { noteName: string; midi: number }>>({});
+  const selectedTrackRef = useRef<{ id: number; type: string; name: string } | null>(null);
+  const playbackTimerRef = useRef<number | null>(null);
 
   const projectName = searchParams.get('projectName') ?? 'SESSION_2023_X4';
   const bpmRaw = Number.parseFloat(searchParams.get('bpm') ?? '128');
   const bpmLabel = Number.isFinite(bpmRaw) ? bpmRaw.toFixed(2) : '128.00';
+  const MIDI_LOW = 21; // A0
+  const MIDI_HIGH = 108; // C8
+  const BEATS_PER_BAR = 4;
+  const STEPS_PER_BEAT = 4;
+  const BEATS_PER_STEP = 1 / STEPS_PER_BEAT;
+  const NOTE_ROW_GAP = 0;
   const GRID_COL_WIDTH = 40;
   const GRID_ROW_HEIGHT = 24;
-  const GRID_TOTAL_ROWS = 72;
+  const GRID_TOTAL_ROWS = MIDI_HIGH - MIDI_LOW + 1;
   const GRID_TOTAL_COLS = 160;
   const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
   const BLACK_SEMITONES = new Set([1, 3, 6, 8, 10]);
-  const PIANO_SAMPLES_URL = 'https://tambien.github.io/Piano/audio/';
+  const bpmNumber = Number.isFinite(bpmRaw) && bpmRaw > 0 ? bpmRaw : 128;
 
   const pianoRows = Array.from({ length: GRID_TOTAL_ROWS }, (_, row) => {
-    const midi = 72 - row;
+    const midi = MIDI_HIGH - row;
     const semitone = ((midi % 12) + 12) % 12;
     const octave = Math.floor(midi / 12) - 1;
     const isBlack = BLACK_SEMITONES.has(semitone);
-    const label = semitone === 0 ? `${NOTE_NAMES[semitone]}${octave}` : '';
+    const label = semitone === 0 || midi === MIDI_LOW || midi === MIDI_HIGH ? `${NOTE_NAMES[semitone]}${octave}` : '';
     return { row, isBlack, label };
   });
 
@@ -205,35 +281,319 @@ function MainEditor() {
       Bus: 'bg-tertiary/10 border-tertiary/20',
     };
 
-    setTracks((prev) => {
-      const nextIndex = prev.length + 1;
-      const createdTrack = {
-        id: Date.now() + nextIndex,
-        type: selectedOption.id,
-        name: `${String(nextIndex).padStart(2, '0')} ${selectedOption.id.toUpperCase()} TRACK`,
-        icon: selectedOption.icon,
-        clipClass: clipClassByType[selectedOption.id] ?? 'bg-primary/10 border-primary/20',
-        notes: [],
-      };
-      return [...prev, createdTrack];
-    });
+    const nextIndex = tracks.length + 1;
+    const createdTrack = {
+      id: Date.now() + nextIndex,
+      type: selectedOption.id,
+      name: `${String(nextIndex).padStart(2, '0')} ${selectedOption.id.toUpperCase()} TRACK`,
+      icon: selectedOption.icon,
+      clipClass: clipClassByType[selectedOption.id] ?? 'bg-primary/10 border-primary/20',
+      notes: [],
+    };
+
+    setTracks((prev) => [...prev, createdTrack]);
+    setSelectedTrackId(createdTrack.id);
 
     setIsAddTrackModalOpen(false);
   };
 
   const handleTrackDoubleClick = (trackId: number) => {
     setActivePianoTrackId(trackId);
+    setSelectedTrackId(trackId);
     setPianoTool('select');
     setSelectedNoteIds([]);
     setIsPianoRollOpen(true);
   };
 
   const activeTrack = tracks.find((track) => track.id === activePianoTrackId) ?? null;
+  const selectedTrack = tracks.find((track) => track.id === selectedTrackId) ?? null;
+  const keyboardPlayableTrack = selectedTrack?.type === 'Instrument' ? selectedTrack : null;
   const activeTrackName = activeTrack?.name ?? 'TRACK';
   const activeTrackNotes = activeTrack?.notes ?? [];
-  const bpmNumber = Number.isFinite(bpmRaw) ? bpmRaw : 128;
+  const activeKeyboardMidiSet = new Set(activeKeyboardMidiNotes);
+  const totalSavedNotes = tracks.reduce((sum, track) => sum + track.notes.length, 0);
+
+  const playbackTotalSteps = Math.max(0, Math.floor((playbackSeconds * bpmNumber * STEPS_PER_BEAT) / 60));
+  const playbackBar = Math.floor(playbackTotalSteps / (BEATS_PER_BAR * STEPS_PER_BEAT)) + 1;
+  const playbackBeat = Math.floor((playbackTotalSteps % (BEATS_PER_BAR * STEPS_PER_BEAT)) / STEPS_PER_BEAT) + 1;
+  const playbackStep = (playbackTotalSteps % STEPS_PER_BEAT) + 1;
+  const playbackCenti = Math.floor((playbackSeconds - Math.floor(playbackSeconds)) * 100);
+  const playbackPositionLabel = `${String(playbackBar).padStart(2, '0')}:${String(playbackBeat).padStart(2, '0')}:${String(playbackStep).padStart(2, '0')}:${String(playbackCenti).padStart(2, '0')}`;
 
   const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+  const midiToNoteName = (midi: number) => Tone.Frequency(midi, 'midi').toNote();
+  const pitchToMidi = (pitch: number) => MIDI_HIGH - pitch;
+  const pitchToNoteName = (pitch: number) => midiToNoteName(pitchToMidi(pitch));
+
+  const ensurePianoSampler = async () => {
+    await Tone.start();
+
+    if (!samplerRef.current) {
+      samplerRef.current = new Tone.Sampler({
+        urls: {
+          A0: 'A0.mp3',
+          C1: 'C1.mp3',
+          'D#1': 'Ds1.mp3',
+          'F#1': 'Fs1.mp3',
+          A1: 'A1.mp3',
+          C2: 'C2.mp3',
+          'D#2': 'Ds2.mp3',
+          'F#2': 'Fs2.mp3',
+          A2: 'A2.mp3',
+          C3: 'C3.mp3',
+          'D#3': 'Ds3.mp3',
+          'F#3': 'Fs3.mp3',
+          A3: 'A3.mp3',
+          C4: 'C4.mp3',
+          'D#4': 'Ds4.mp3',
+          'F#4': 'Fs4.mp3',
+          A4: 'A4.mp3',
+          C5: 'C5.mp3',
+          'D#5': 'Ds5.mp3',
+          'F#5': 'Fs5.mp3',
+          A5: 'A5.mp3',
+          C6: 'C6.mp3',
+          'D#6': 'Ds6.mp3',
+          'F#6': 'Fs6.mp3',
+          A6: 'A6.mp3',
+          C7: 'C7.mp3',
+          'D#7': 'Ds7.mp3',
+          'F#7': 'Fs7.mp3',
+          A7: 'A7.mp3',
+          C8: 'C8.mp3',
+        },
+        release: 1,
+        baseUrl: 'https://tonejs.github.io/audio/salamander/',
+      }).toDestination();
+      await Tone.loaded();
+    }
+
+    return samplerRef.current;
+  };
+
+  const triggerPianoPreview = async (pitch: number, durationSeconds = 0.35) => {
+    try {
+      const sampler = await ensurePianoSampler();
+      sampler.triggerAttackRelease(pitchToNoteName(pitch), durationSeconds);
+    } catch {
+      // Ignore audio context errors if browser blocks autoplay before a valid gesture.
+    }
+  };
+
+  const stopPlaybackClock = () => {
+    if (playbackTimerRef.current !== null) {
+      window.clearInterval(playbackTimerRef.current);
+      playbackTimerRef.current = null;
+    }
+  };
+
+  const startPlaybackClock = () => {
+    stopPlaybackClock();
+    playbackTimerRef.current = window.setInterval(() => {
+      setPlaybackSeconds(Tone.Transport.seconds);
+    }, 40);
+  };
+
+  const stopTransportPlayback = (resetPosition = true) => {
+    Tone.Transport.stop();
+    Tone.Transport.cancel(0);
+    stopPlaybackClock();
+    setIsPlaying(false);
+
+    if (resetPosition) {
+      Tone.Transport.position = 0;
+      setPlaybackSeconds(0);
+    }
+  };
+
+  const handlePlayAllTracks = async () => {
+    const allTrackNotes = tracks.flatMap((track) =>
+      track.notes.map((note) => ({
+        ...note,
+        trackId: track.id,
+      })),
+    );
+
+    if (allTrackNotes.length === 0) {
+      stopTransportPlayback(true);
+      return;
+    }
+
+    try {
+      await ensurePianoSampler();
+    } catch {
+      return;
+    }
+
+    releaseHeldKeyboardNotes();
+    stopTransportPlayback(true);
+    Tone.Transport.bpm.value = bpmNumber;
+
+    const secondsPerBeat = 60 / bpmNumber;
+    let playbackLengthSeconds = 0;
+
+    allTrackNotes.forEach((note) => {
+      const startSeconds = note.start * BEATS_PER_STEP * secondsPerBeat;
+      const durationSeconds = Math.max(BEATS_PER_STEP * secondsPerBeat, note.length * BEATS_PER_STEP * secondsPerBeat);
+      const noteName = pitchToNoteName(note.pitch);
+
+      playbackLengthSeconds = Math.max(playbackLengthSeconds, startSeconds + durationSeconds);
+
+      Tone.Transport.schedule((time) => {
+        samplerRef.current?.triggerAttackRelease(noteName, durationSeconds, time, 0.88);
+      }, startSeconds);
+    });
+
+    Tone.Transport.scheduleOnce(() => {
+      window.requestAnimationFrame(() => {
+        stopTransportPlayback(true);
+      });
+    }, playbackLengthSeconds + 0.05);
+
+    Tone.Transport.position = 0;
+    setPlaybackSeconds(0);
+    setIsPlaying(true);
+    startPlaybackClock();
+    Tone.Transport.start('+0.02');
+  };
+
+  const releaseHeldKeyboardNotes = () => {
+    const sampler = samplerRef.current;
+    const heldNotes = Object.values(heldKeyboardNotesRef.current);
+
+    if (sampler) {
+      heldNotes.forEach((noteState) => {
+        sampler.triggerRelease(noteState.noteName, Tone.now());
+      });
+    }
+
+    heldKeyboardNotesRef.current = {};
+    setActiveKeyboardMidiNotes([]);
+  };
+
+  const isTypingIntoInput = (target: EventTarget | null) => {
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+
+    const tag = target.tagName;
+    return target.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  };
+
+  useEffect(() => {
+    if (tracks.length === 0) {
+      if (selectedTrackId !== null) {
+        setSelectedTrackId(null);
+      }
+      return;
+    }
+
+    if (selectedTrackId === null || !tracks.some((track) => track.id === selectedTrackId)) {
+      setSelectedTrackId(tracks[0].id);
+    }
+  }, [tracks, selectedTrackId]);
+
+  useEffect(() => {
+    selectedTrackRef.current = selectedTrack
+      ? { id: selectedTrack.id, type: selectedTrack.type, name: selectedTrack.name }
+      : null;
+  }, [selectedTrack]);
+
+  useEffect(() => {
+    if (!keyboardPlayableTrack) {
+      releaseHeldKeyboardNotes();
+    }
+  }, [keyboardPlayableTrack]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.ctrlKey || event.metaKey || event.altKey || isTypingIntoInput(event.target)) {
+        return;
+      }
+
+      const baseMidi = KEYBOARD_BASE_CODE_TO_MIDI[event.code];
+      const currentSelectedTrack = selectedTrackRef.current;
+      if (baseMidi === undefined || !currentSelectedTrack || currentSelectedTrack.type !== 'Instrument') {
+        return;
+      }
+
+      if (heldKeyboardNotesRef.current[event.code]) {
+        return;
+      }
+
+      const sharpOffset = event.shiftKey && KEYBOARD_SHIFT_SHARP_CODES.has(event.code) ? 1 : 0;
+      const midi = clamp(baseMidi + sharpOffset, MIDI_LOW, MIDI_HIGH);
+      const noteName = midiToNoteName(midi);
+
+      event.preventDefault();
+      heldKeyboardNotesRef.current[event.code] = { noteName, midi };
+      setActiveKeyboardMidiNotes((prev) => {
+        if (prev.includes(midi)) {
+          return prev;
+        }
+        return [...prev, midi].sort((a, b) => a - b);
+      });
+
+      void ensurePianoSampler()
+        .then((sampler) => {
+          const heldState = heldKeyboardNotesRef.current[event.code];
+          if (heldState && heldState.noteName === noteName) {
+            sampler.triggerAttack(noteName, Tone.now(), 0.9);
+          }
+        })
+        .catch(() => {
+          const failedState = heldKeyboardNotesRef.current[event.code];
+          if (failedState) {
+            setActiveKeyboardMidiNotes((prev) => prev.filter((value) => value !== failedState.midi));
+          }
+          delete heldKeyboardNotesRef.current[event.code];
+        });
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      const noteState = heldKeyboardNotesRef.current[event.code];
+      if (!noteState) {
+        return;
+      }
+
+      event.preventDefault();
+      delete heldKeyboardNotesRef.current[event.code];
+      samplerRef.current?.triggerRelease(noteState.noteName, Tone.now());
+      setActiveKeyboardMidiNotes((prev) => prev.filter((value) => value !== noteState.midi));
+    };
+
+    const handleBlur = () => {
+      releaseHeldKeyboardNotes();
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        releaseHeldKeyboardNotes();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      releaseHeldKeyboardNotes();
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopTransportPlayback(true);
+      releaseHeldKeyboardNotes();
+      samplerRef.current?.dispose();
+      samplerRef.current = null;
+    };
+  }, []);
 
   const updateActiveTrackNotes = (updater: (notes: Array<{ id: number; start: number; pitch: number; length: number }>) => Array<{ id: number; start: number; pitch: number; length: number }>) => {
     if (activePianoTrackId === null) {
@@ -243,69 +603,6 @@ function MainEditor() {
     setTracks((prev) =>
       prev.map((track) => (track.id === activePianoTrackId ? { ...track, notes: updater(track.notes) } : track)),
     );
-  };
-
-  const rowToNote = (row: number) => {
-    const midi = clamp(72 - row, 21, 108);
-    const semitone = ((midi % 12) + 12) % 12;
-    const octave = Math.floor(midi / 12) - 1;
-    return `${NOTE_NAMES[semitone]}${octave}`;
-  };
-
-  const ensurePianoAudioReady = async () => {
-    if (pianoEngineRef.current && isAudioReady) {
-      return true;
-    }
-
-    if (isAudioLoading) {
-      return false;
-    }
-
-    setIsAudioLoading(true);
-    setAudioError(null);
-    try {
-      await Tone.start();
-
-      if (!pianoEngineRef.current) {
-        const piano = new Piano({
-          url: PIANO_SAMPLES_URL,
-          velocities: 2,
-          minNote: 24,
-          maxNote: 96,
-          release: false,
-          pedal: false,
-          maxPolyphony: 24,
-        });
-        piano.toDestination();
-        await piano.load();
-        pianoEngineRef.current = piano;
-      }
-
-      setIsAudioReady(true);
-      return true;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to initialize piano audio';
-      setAudioError(`Piano load failed: ${message}`);
-      pianoEngineRef.current?.dispose();
-      pianoEngineRef.current = null;
-      setIsAudioReady(false);
-      return false;
-    } finally {
-      setIsAudioLoading(false);
-    }
-  };
-
-  const previewPitch = (pitch: number, beats = 0.5) => {
-    const piano = pianoEngineRef.current;
-    if (!piano) {
-      return;
-    }
-
-    const note = rowToNote(pitch);
-    const now = Tone.now();
-    const durationSec = Math.max(0.12, (60 / bpmNumber) * beats);
-    piano.keyDown({ note, velocity: 0.85, time: now });
-    piano.keyUp({ note, time: now + durationSec });
   };
 
   const getPointerInGrid = (clientX: number, clientY: number) => {
@@ -382,12 +679,7 @@ function MainEditor() {
       },
     ]);
     setSelectedNoteIds([createdId]);
-    void (async () => {
-      const ready = await ensurePianoAudioReady();
-      if (ready) {
-        previewPitch(snappedPitch, 0.5);
-      }
-    })();
+    void triggerPianoPreview(snappedPitch);
   };
 
   const handleGridDoubleClick = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -418,12 +710,7 @@ function MainEditor() {
     ]);
     setSelectedNoteIds([createdId]);
     setSelectionBox(null);
-    void (async () => {
-      const ready = await ensurePianoAudioReady();
-      if (ready) {
-        previewPitch(snappedPitch, 0.5);
-      }
-    })();
+    void triggerPianoPreview(snappedPitch);
   };
 
   const handleNoteMouseDown = (
@@ -466,22 +753,7 @@ function MainEditor() {
       startClientX: event.clientX,
       startClientY: event.clientY,
     });
-
-    void (async () => {
-      const ready = await ensurePianoAudioReady();
-      if (ready) {
-        previewPitch(note.pitch, 0.25);
-      }
-    })();
   };
-
-  useEffect(() => {
-    return () => {
-      pianoEngineRef.current?.stopAll();
-      pianoEngineRef.current?.dispose();
-      pianoEngineRef.current = null;
-    };
-  }, []);
 
   useEffect(() => {
     if (!dragState) {
@@ -565,8 +837,8 @@ function MainEditor() {
           .filter((note) => {
             const noteLeft = note.start * GRID_COL_WIDTH;
             const noteRight = noteLeft + note.length * GRID_COL_WIDTH;
-            const noteTop = note.pitch * GRID_ROW_HEIGHT + 2;
-            const noteBottom = noteTop + 20;
+            const noteTop = note.pitch * GRID_ROW_HEIGHT;
+            const noteBottom = noteTop + (GRID_ROW_HEIGHT - NOTE_ROW_GAP);
 
             return noteRight >= minX && noteLeft <= maxX && noteBottom >= minY && noteTop <= maxY;
           })
@@ -606,8 +878,28 @@ function MainEditor() {
         <div className="flex items-center bg-surface-container-low px-4 py-1 gap-8 ghost-border">
           <div className="flex items-center gap-4">
             <button className="text-on-surface-variant hover:text-primary transition-colors"><span className="material-symbols-outlined">skip_previous</span></button>
-            <button className="text-primary active:scale-95"><span className="material-symbols-outlined" style={{ fontVariationSettings: "'FILL' 1" }}>play_arrow</span></button>
-            <button className="text-on-surface-variant hover:text-primary transition-colors"><span className="material-symbols-outlined">stop</span></button>
+            <button
+              onClick={() => {
+                if (isPlaying) {
+                  stopTransportPlayback(true);
+                  return;
+                }
+                void handlePlayAllTracks();
+              }}
+              className={`active:scale-95 transition-colors ${!isPlaying && totalSavedNotes === 0 ? 'text-zinc-700 cursor-not-allowed' : 'text-primary hover:text-[#f4ffc6]'}`}
+              disabled={!isPlaying && totalSavedNotes === 0}
+              title={isPlaying ? 'Stop Playback' : 'Play All Tracks'}
+            >
+              <span className="material-symbols-outlined" style={{ fontVariationSettings: "'FILL' 1" }}>{isPlaying ? 'pause' : 'play_arrow'}</span>
+            </button>
+            <button
+              onClick={() => stopTransportPlayback(true)}
+              className={`transition-colors ${isPlaying ? 'text-on-surface-variant hover:text-primary' : 'text-zinc-700 cursor-not-allowed'}`}
+              disabled={!isPlaying}
+              title="Stop Playback"
+            >
+              <span className="material-symbols-outlined">stop</span>
+            </button>
             <button className="text-error active:scale-95"><span className="material-symbols-outlined" style={{ fontVariationSettings: "'FILL' 1" }}>fiber_manual_record</span></button>
           </div>
           <div className="flex gap-6 font-mono text-[13px] text-primary">
@@ -617,11 +909,11 @@ function MainEditor() {
             </div>
             <div className="flex flex-col items-center border-x border-outline-variant/20 px-6">
               <span className="text-[9px] text-on-surface-variant uppercase font-bold tracking-tighter">Position</span>
-              <span className="text-lg leading-none">00:00:00:00</span>
+              <span className="text-lg leading-none">{playbackPositionLabel}</span>
             </div>
             <div className="flex flex-col items-center">
-              <span className="text-[9px] text-on-surface-variant uppercase font-bold tracking-tighter">CPU</span>
-              <span className="text-on-surface-variant">14%</span>
+              <span className="text-[9px] text-on-surface-variant uppercase font-bold tracking-tighter">State</span>
+              <span className={isPlaying ? 'text-primary' : 'text-on-surface-variant'}>{isPlaying ? 'PLAY' : 'IDLE'}</span>
             </div>
           </div>
         </div>
@@ -697,50 +989,58 @@ function MainEditor() {
               <div className="flex-1 border-b border-outline-variant/5"></div>
             </div>
 
-            {tracks.map((track) => (
-              <div
-                key={track.id}
-                onDoubleClick={() => handleTrackDoubleClick(track.id)}
-                className="h-20 flex bg-surface-container-low/50 border-b border-outline-variant/5 cursor-pointer hover:bg-surface-container-low"
-              >
-                <div className="w-48 bg-surface-container-high border-r border-outline-variant/10 p-3 flex flex-col justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="material-symbols-outlined text-sm text-primary">{track.icon}</span>
-                    <span className="font-mono text-[10px] text-primary truncate">{track.name}</span>
-                  </div>
-                  <div className="flex gap-1">
-                    <div className="w-6 h-4 bg-surface-bright flex items-center justify-center text-[8px] font-bold">M</div>
-                    <div className="w-6 h-4 bg-surface-bright flex items-center justify-center text-[8px] font-bold">S</div>
-                  </div>
-                </div>
-                <div className="flex-1 relative">
-                  <div className={`absolute inset-y-4 left-8 right-24 border ${track.clipClass} overflow-hidden`}>
-                    {track.notes.length > 0 &&
-                      track.notes.map((note) => {
-                        const maxSteps = Math.max(
-                          16,
-                          ...track.notes.map((item) => item.start + item.length),
-                        );
-                        const leftPercent = (note.start / maxSteps) * 100;
-                        const widthPercent = (note.length / maxSteps) * 100;
-                        const topPercent = (note.pitch / GRID_TOTAL_ROWS) * 100;
+            {tracks.map((track) => {
+              const isSelected = selectedTrackId === track.id;
 
-                        return (
-                          <div
-                            key={note.id}
-                            className="absolute h-[3px] bg-primary/90"
-                            style={{
-                              left: `${leftPercent}%`,
-                              width: `${Math.max(widthPercent, 1)}%`,
-                              top: `${Math.min(topPercent, 95)}%`,
-                            }}
-                          ></div>
-                        );
-                      })}
+              return (
+                <div
+                  key={track.id}
+                  onClick={() => setSelectedTrackId(track.id)}
+                  onDoubleClick={() => handleTrackDoubleClick(track.id)}
+                  className={`h-20 flex border-b border-outline-variant/5 cursor-pointer transition-colors ${isSelected ? 'bg-surface-container-high/80 ring-1 ring-primary/35' : 'bg-surface-container-low/50 hover:bg-surface-container-low'}`}
+                >
+                  <div className={`w-48 border-r border-outline-variant/10 p-3 flex flex-col justify-between ${isSelected ? 'bg-surface-container-highest/90' : 'bg-surface-container-high'}`}>
+                    <div className="flex items-center gap-2">
+                      <span className="material-symbols-outlined text-sm text-primary">{track.icon}</span>
+                      <span className="font-mono text-[10px] text-primary truncate">{track.name}</span>
+                      {isSelected && (
+                        <span className="ml-auto text-[8px] font-mono uppercase tracking-wider text-primary">SEL</span>
+                      )}
+                    </div>
+                    <div className="flex gap-1">
+                      <div className="w-6 h-4 bg-surface-bright flex items-center justify-center text-[8px] font-bold">M</div>
+                      <div className="w-6 h-4 bg-surface-bright flex items-center justify-center text-[8px] font-bold">S</div>
+                    </div>
+                  </div>
+                  <div className="flex-1 relative">
+                    <div className={`absolute inset-y-4 left-8 right-24 border ${track.clipClass} overflow-hidden`}>
+                      {track.notes.length > 0 &&
+                        track.notes.map((note) => {
+                          const maxSteps = Math.max(
+                            16,
+                            ...track.notes.map((item) => item.start + item.length),
+                          );
+                          const leftPercent = (note.start / maxSteps) * 100;
+                          const widthPercent = (note.length / maxSteps) * 100;
+                          const topPercent = (note.pitch / GRID_TOTAL_ROWS) * 100;
+
+                          return (
+                            <div
+                              key={note.id}
+                              className="absolute h-[3px] bg-primary/90"
+                              style={{
+                                left: `${leftPercent}%`,
+                                width: `${Math.max(widthPercent, 1)}%`,
+                                top: `${Math.min(topPercent, 95)}%`,
+                              }}
+                            ></div>
+                          );
+                        })}
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           <div className="h-48 bg-surface-container-low border-t border-outline-variant/20 flex gap-[2px] p-[2px]">
@@ -756,7 +1056,16 @@ function MainEditor() {
               {tracks.length === 0 ? (
                 <span className="text-zinc-600 font-mono text-xs font-bold uppercase">No Active Tracks</span>
               ) : (
-                <span className="text-primary font-mono text-xs font-bold uppercase">Active Tracks: {tracks.length}</span>
+                <div className="flex flex-col items-center leading-tight">
+                  <span className="text-primary font-mono text-xs font-bold uppercase">Active Tracks: {tracks.length}</span>
+                  <span className={`font-mono text-[10px] uppercase ${keyboardPlayableTrack ? 'text-primary/80' : 'text-zinc-500'}`}>
+                    {keyboardPlayableTrack
+                      ? `Keyboard Ready: ${keyboardPlayableTrack.name}`
+                      : selectedTrack
+                        ? 'Keyboard Disabled: Select Instrument Track'
+                        : 'Keyboard Disabled: Select Track'}
+                  </span>
+                </div>
               )}
             </div>
           </div>
@@ -817,6 +1126,7 @@ function MainEditor() {
           <span className="font-mono text-[9px] uppercase tracking-tighter text-zinc-500">Bach Studio Engine v2.4 | CPU: 14% | RAM: 2.4GB</span>
         </div>
         <div className="flex items-center gap-4">
+          <span className="font-mono text-[9px] uppercase tracking-tighter text-primary/80">KB: MPP MAP (T=C4, S=C5, M=C7)</span>
           <a className="font-mono text-[9px] uppercase tracking-tighter text-zinc-600 hover:text-white" href="#">Buffer: 128</a>
           <a className="font-mono text-[9px] uppercase tracking-tighter text-[#f4ffc6] hover:text-white" href="#">44.1kHz</a>
           <a className="font-mono text-[9px] uppercase tracking-tighter text-zinc-600 hover:text-white" href="#">24-bit</a>
@@ -928,31 +1238,27 @@ function MainEditor() {
                   <span className="material-symbols-outlined text-xs">mic</span>
                   Humming AI
                 </button>
-                <button
-                  onClick={() => {
-                    void ensurePianoAudioReady();
-                  }}
-                  className="flex items-center gap-1 px-2 py-1 text-[9px] font-mono uppercase border border-outline-variant/30 text-primary hover:bg-surface-bright transition-colors"
-                >
-                  <span className="material-symbols-outlined text-xs">piano</span>
-                  {isAudioLoading
-                    ? 'Loading Piano...'
-                    : isAudioReady
-                      ? 'Piano Ready'
-                      : audioError
-                        ? 'Retry Piano Audio'
-                        : 'Enable Piano Audio'}
-                </button>
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-[9px] font-mono uppercase text-on-surface-variant">Keys</span>
+                  <div className="flex items-center gap-1 overflow-x-auto no-scrollbar max-w-[280px]">
+                    {activeKeyboardMidiNotes.length === 0 ? (
+                      <span className="px-2 py-0.5 text-[9px] font-mono uppercase text-zinc-500 border border-outline-variant/30 whitespace-nowrap">
+                        Press Computer Keyboard
+                      </span>
+                    ) : (
+                      activeKeyboardMidiNotes.slice(-8).map((midi) => (
+                        <span key={midi} className="px-2 py-0.5 text-[9px] font-mono font-bold uppercase text-black bg-primary border border-primary/80 shadow-[0_0_10px_rgba(244,255,198,0.45)] whitespace-nowrap">
+                          {midiToNoteName(midi)}
+                        </span>
+                      ))
+                    )}
+                  </div>
+                </div>
                 <div className="flex-1"></div>
                 <div className="flex items-center gap-4 text-[10px] font-mono text-primary">
                   <span className="text-on-surface-variant">BPM:</span> {bpmLabel}
                 </div>
               </div>
-              {audioError && (
-                <div className="px-4 py-1 text-[10px] font-mono text-error uppercase tracking-wide border-b border-error/30 bg-error/10">
-                  {audioError}
-                </div>
-              )}
 
               <div className="flex-1 flex overflow-hidden">
                 <div
@@ -961,18 +1267,34 @@ function MainEditor() {
                   className="w-20 flex-shrink-0 bg-surface-container-highest overflow-y-auto overflow-x-hidden border-r border-outline-variant/20 no-scrollbar"
                 >
                   {pianoRows.map((key) => (
-                    <div key={key.row} className="h-6 border-b border-black/30 relative">
-                      {key.isBlack ? (
-                        <div className="h-full w-[70%] bg-[#0a0a0a] border-r border-black/70"></div>
-                      ) : (
-                        <div className="h-full w-full bg-[#d8d8d8] border-r border-zinc-500/50"></div>
-                      )}
-                      {key.label && (
-                        <span className={`absolute right-1 bottom-0.5 text-[8px] font-bold ${key.isBlack ? 'text-zinc-200' : 'text-zinc-800'}`}>
-                          {key.label}
-                        </span>
-                      )}
-                    </div>
+                    (() => {
+                      const midi = MIDI_HIGH - key.row;
+                      const isPressed = activeKeyboardMidiSet.has(midi);
+
+                      return (
+                        <button
+                          key={key.row}
+                          onMouseDown={() => {
+                            void triggerPianoPreview(key.row, 0.45);
+                          }}
+                          className={`block h-[23px] mb-px relative w-full text-left transition-all duration-75 ${isPressed ? 'z-20 shadow-[inset_0_0_0_1px_rgba(244,255,198,0.9),0_0_14px_rgba(244,255,198,0.5)]' : ''}`}
+                        >
+                          {key.isBlack ? (
+                            <div className={`h-full w-[70%] border-r transition-colors duration-75 ${isPressed ? 'bg-primary border-primary/80' : 'bg-[#0a0a0a] border-black/70'}`}></div>
+                          ) : (
+                            <div className={`h-full w-full border-r transition-colors duration-75 ${isPressed ? 'bg-primary border-primary/80' : 'bg-[#d8d8d8] border-zinc-500/50'}`}></div>
+                          )}
+                          {isPressed && (
+                            <div className="absolute inset-0 bg-primary/25 pointer-events-none"></div>
+                          )}
+                          {key.label && (
+                            <span className={`absolute right-1 bottom-0.5 text-[8px] font-bold transition-colors ${isPressed ? 'text-black' : key.isBlack ? 'text-zinc-200' : 'text-zinc-800'}`}>
+                              {key.label}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })()
                   ))}
                 </div>
 
@@ -985,8 +1307,7 @@ function MainEditor() {
                   style={{
                     cursor: pianoTool === 'draw' ? 'crosshair' : 'default',
                     backgroundSize: '40px 24px',
-                    backgroundImage:
-                      'linear-gradient(to right, #262626 1px, transparent 1px), linear-gradient(to bottom, #262626 1px, transparent 1px)',
+                    backgroundImage: 'linear-gradient(to right, #262626 1px, transparent 1px)',
                   }}
                 >
                   <div
@@ -996,7 +1317,33 @@ function MainEditor() {
                       height: `${GRID_TOTAL_ROWS * GRID_ROW_HEIGHT}px`,
                     }}
                   >
+                    <div className="absolute inset-0 pointer-events-none z-0">
+                      {pianoRows.map((key) => (
+                        <div
+                          key={`row-bg-${key.row}`}
+                          className={`absolute left-0 right-0 border-b border-black/35 ${key.isBlack ? 'bg-black/20' : 'bg-white/[0.02]'}`}
+                          style={{
+                            top: `${key.row * GRID_ROW_HEIGHT}px`,
+                            height: `${GRID_ROW_HEIGHT}px`,
+                          }}
+                        ></div>
+                      ))}
+                    </div>
                     <div className="absolute top-0 bottom-0 left-64 w-[2px] bg-primary z-30 shadow-[0_0_10px_rgba(244,255,198,0.5)]"></div>
+                  {activeKeyboardMidiNotes.map((midi) => {
+                    const row = MIDI_HIGH - midi;
+
+                    return (
+                      <div
+                        key={`kbd-guide-${midi}`}
+                        className="absolute left-0 right-0 pointer-events-none z-20 bg-primary/18 border-y border-primary/65 shadow-[inset_0_0_10px_rgba(244,255,198,0.55)]"
+                        style={{
+                          top: `${row * GRID_ROW_HEIGHT}px`,
+                          height: `${GRID_ROW_HEIGHT}px`,
+                        }}
+                      ></div>
+                    );
+                  })}
                   {activeTrackNotes.length === 0 && (
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                       <span className="text-zinc-500 font-mono text-[10px] uppercase tracking-widest">
@@ -1029,11 +1376,12 @@ function MainEditor() {
                           setSelectedNoteIds((prev) => prev.filter((id) => id !== note.id));
                         }
                       }}
-                      className={`absolute h-[20px] text-black flex items-center px-2 text-[9px] font-bold border-l-2 ${pianoTool === 'select' ? 'cursor-grab active:cursor-grabbing' : 'cursor-default'} ${selectedNoteIds.includes(note.id) ? 'bg-primary border-primary-container ring-1 ring-white/60' : 'bg-primary/80 border-primary-container/70'}`}
+                      className={`absolute text-black flex items-center px-2 text-[9px] font-bold border-l-2 ${pianoTool === 'select' ? 'cursor-grab active:cursor-grabbing' : 'cursor-default'} ${selectedNoteIds.includes(note.id) ? 'bg-primary border-primary-container ring-1 ring-white/60' : 'bg-primary/80 border-primary-container/70'}`}
                       style={{
-                        top: `${note.pitch * GRID_ROW_HEIGHT + 2}px`,
+                        top: `${note.pitch * GRID_ROW_HEIGHT}px`,
                         left: `${note.start * GRID_COL_WIDTH}px`,
                         width: `${note.length * GRID_COL_WIDTH}px`,
+                        height: `${GRID_ROW_HEIGHT - NOTE_ROW_GAP}px`,
                       }}
                       title="Select mode: click to select, drag to move, drag right resize handle to resize, right-click to delete"
                     >
